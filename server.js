@@ -120,10 +120,14 @@ function pickAccount() {
   if (byIdx && byIdx.key && byIdx.enabled !== false) return byIdx;
   return list[0];
 }
-const chatHeaders = (key) => ({
-  'Content-Type': 'application/json',
-  Authorization: `Bearer ${key}`,
-});
+const chatHeaders = (key, taskId) => {
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${key}`,
+  };
+  if (taskId !== undefined) headers['X-Task-ID'] = taskId;
+  return headers;
+};
 
 // 代理密钥：非空时，/v1/* 与 /api/* 均需鉴权（Authorization: Bearer <key> 或 X-Admin-Key: <key>）；
 // 控制台页面本身保持开放（不含任何敏感数据，数据由带鉴权的 /api/* 提供）。
@@ -223,9 +227,9 @@ function parseRouting(json) {
 async function harvestAvailableProviders(modelId, pipeline) {
   const acc = pickAccount();
   const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
-  const body = pipeline === 'planner'
+  const body = injectPrefs(pipeline === 'planner'
     ? { ...base, providerOptions: { gateway: { only: ['__probe__'] } } }
-    : { ...base, provider: { only: ['__probe__'] } };
+    : { ...base, provider: { only: ['__probe__'] } }, modelId, { upstream: null, has: getHas(modelId, config.perModel[modelId]) });
   const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body) }, 60000);
   const err = json?.error;
   if (typeof err !== 'string') return null;
@@ -251,7 +255,7 @@ function parseTier0(plan) {
 async function probeModel(modelId) {
   const acc = pickAccount();
   const t0 = Date.now();
-  const body = { model: modelId, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
+  const body = injectPrefs({ model: modelId, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 }, modelId, { upstream: null, has: getHas(modelId, config.perModel[modelId]) });
   const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
     method: 'POST',
     headers: chatHeaders(acc.key),
@@ -335,7 +339,6 @@ function learnAvailableProviders(modelId, errMsg) {
 async function validateUpstreams(modelId) {
   const meta = META.models[modelId] || {};
   const list = meta.upstreams || [];
-  const pipeline = meta.pipeline;
   const acc = pickAccount();
   const results = {};
   const batch = 5;
@@ -343,9 +346,7 @@ async function validateUpstreams(modelId) {
     await Promise.all(list.slice(i, i + batch).map(async (slug) => {
       const t0 = Date.now();
       const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
-      const body = pipeline === 'planner'
-        ? { ...base, providerOptions: { gateway: { only: [slug] } } }
-        : { ...base, provider: { only: [slug] } };
+      const body = injectPrefs(base, modelId, { upstream: slug, has: getHas(modelId, config.perModel[modelId]) });
       const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
         method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body),
       }, 60000).catch(() => ({ json: { error: 'network error' } }));
@@ -465,15 +466,15 @@ const OR_SORT = { cost: 'price', ttft: 'latency', tps: 'throughput' };
 // excludeList: 排除列表。网关不支持 exclude/ignore 字段（实测被静默忽略），因此排除统一换算成 only 白名单：
 // 自动模式 only=已知上游-排除；preferred 钉住模式 order=[当前,...] 且 only=已知上游-排除（防止网关回退到被排除渠道）；
 // 严格钉住模式 only=[当前上游]，天然排除其他一切渠道。
-function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null }) {
+function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null, has = [] }) {
   const b = JSON.parse(JSON.stringify(body));
   const exclude = (excludeList || []).filter((u) => u !== upstream);
   const meta = META.models[modelId] || {};
   const known = meta.upstreams || [];
   const allowList = exclude.length ? known.filter((u) => !exclude.includes(u)) : null;
-  if (!upstream && !sort && !(allowList && allowList.length)) return b;
+  if (!upstream && !sort && !has.length && !(allowList && allowList.length)) return b;
   const pipeline = meta.pipeline || null;
-  const useVercel = pipeline === 'planner' || pipeline === null;
+  const useVercel = pipeline === 'planner' || pipeline === null || has.length > 0;
   const useOpenRouter = pipeline === 'direct' || pipeline === null;
   if (useVercel) {
     const gw = {};
@@ -487,6 +488,7 @@ function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = []
       gw.only = allowList;
     }
     if (sort) gw.sort = sort;
+    if (has.length) gw.has = has;
     b.providerOptions = { ...(b.providerOptions || {}), gateway: { ...(b.providerOptions?.gateway || {}), ...gw } };
   }
   if (useOpenRouter) {
@@ -506,6 +508,12 @@ function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = []
   return b;
 }
 
+function getHas(modelId, cfg) {
+  if (cfg?.hasEnabled !== true) return [];
+  const values = cfg.has ?? (/(?:^|\/)deepseek(?:[\/.-]|$)/i.test(modelId) ? ['vision', 'implicit-caching'] : []);
+  return [...new Set((Array.isArray(values) ? values : []).filter((v) => typeof v === 'string').map((v) => v.trim()).filter(Boolean))];
+}
+
 // 由 perModel 配置展开出故障转移候选序列：[{ upstream, orderRest, excludeList, strict, sort }, ...]
 // - 勾选了上游（排除后非空）：逐个尝试，排除的永不在候选中
 // - 未勾选：单候选自动模式，排除换算成 only 白名单注入（见 injectPrefs）
@@ -516,7 +524,7 @@ function buildAttempts(modelId, cfg) {
   const wanted = listed.filter((u) => !excl.has(u));
   const strict = (cfg?.pinMode || 'strict') === 'strict';
   const sort = cfg?.sort || null;
-  const base = { strict, sort, excludeList: exclude };
+  const base = { strict, sort, excludeList: exclude, has: getHas(modelId, cfg) };
   if (wanted.length) {
     // preferred 模式：当前上游排在 order 首位，其余勾选项作为网关侧回退序列；排除列表随行（限制网关回退范围）
     return wanted.map((u, i) => ({ ...base, upstream: u, orderRest: strict ? [] : wanted.filter((_, j) => j !== i) }));
@@ -529,12 +537,12 @@ const errText = (e) => (e == null ? '' : typeof e === 'string' ? e : JSON.string
 
 // 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, acc }
 // 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换
-async function attemptOnce(modelId, body, attempt, signal) {
+async function attemptOnce(modelId, body, attempt, signal, taskId) {
   const send = injectPrefs(body, modelId, attempt);
   const acc = pickAccount();
   try {
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
-      method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
+      method: 'POST', headers: chatHeaders(acc.key, taskId), body: JSON.stringify(send), signal,
     });
     const json = await res.json().catch(() => null);
     if (!json) return { status: 502, out: { error: { message: 'upstream returned non-JSON', type: 'upstream_error' } }, routing: {}, netError: 'non-JSON response', acc };
@@ -550,6 +558,7 @@ async function attemptOnce(modelId, body, attempt, signal) {
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
 // 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
 async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
+  const taskId = req.headers['x-task-id'];
   const attempts = buildAttempts(modelId, cfg);
   const trace = [];
   const t0 = Date.now();
@@ -571,7 +580,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           let up = null;
           let netError = null;
           try {
-            up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
+            up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key, taskId), body: JSON.stringify(send), signal: ctrl.signal });
           } catch (e) { netError = e.message; }
           const ctype = up?.headers?.get('content-type') || '';
           let isSSE = !!up && up.status === 200 && ctype.includes('event-stream');
@@ -634,7 +643,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
+        const r = await attemptOnce(modelId, body, attempt, ctrl.signal, taskId);
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
         trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
@@ -790,13 +799,15 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/test') {
       // 临时配置可带 upstreams/exclude（数组）或旧版 upstream（单值），完整走故障转移链路
-      const { model, upstream, upstreams, exclude } = await JSON.parse(await readBody(req).then((b) => b.toString()));
+      const { model, upstream, upstreams, exclude, hasEnabled, has } = await JSON.parse(await readBody(req).then((b) => b.toString()));
       if (!model) return sendJSON(res, 400, { error: 'model required' });
       const t0 = Date.now();
       const cfg = { ...(config.perModel[model] || {}) };
       if (upstreams !== undefined) cfg.upstreams = upstreams;
       else if (upstream !== undefined) cfg.upstreams = upstream ? [upstream] : [];
       if (exclude !== undefined) cfg.exclude = exclude;
+      if (hasEnabled !== undefined) cfg.hasEnabled = hasEnabled;
+      if (has !== undefined) cfg.has = has;
       const body = { model, messages: [{ role: 'user', content: 'Reply with the word OK' }], max_tokens: 256 };
       const chain = await runChatChain(req, body, model, cfg, { stream: false, attemptTimeoutMs: 180000 });
       const trace = chain.trace || [];
@@ -905,6 +916,8 @@ const server = http.createServer(async (req, res) => {
             exclude,
             pinMode: c.pinMode === 'preferred' ? 'preferred' : 'strict',
             sort: ['cost', 'ttft', 'tps'].includes(c.sort) ? c.sort : null,
+            hasEnabled: c.hasEnabled === true,
+            has: getHas(m, { ...c, hasEnabled: true }),
           };
         }
         saveConfig();

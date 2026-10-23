@@ -35,6 +35,8 @@
   .badge.orange { background: #3d2f1a; color: var(--orange); }
   select, input[type=number] { background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; max-width: 200px; }
   input[type=number] { width: 64px; }
+  .has-values { background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12px; width: 200px; margin-top: 4px; }
+  .has-toggle { display: block; margin-top: 8px; font-size: 12px; white-space: nowrap; }
   .row-actions { display: flex; gap: 6px; }
   .result { margin-top: 12px; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.8; display: none; white-space: pre-wrap; word-break: break-all; }
   .kvs { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -322,6 +324,7 @@ function render() {
     const pipe = m?.pinnable ? `<span class="badge green">可精确钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
     const mode = s.config.pinMode || 'strict';
     const sort = s.config.sort || '';
+    const has = s.config.has ?? (/(?:^|\/)deepseek(?:[\/.-]|$)/i.test(s.id) ? ['vision', 'implicit-caching'] : []);
     return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${s.id}">
       <td class="mono">${s.id}<div style="margin-top:4px">${pipe}</div>${tier0}</td>
       <td>${canon}</td>
@@ -341,6 +344,8 @@ function render() {
           <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
           <option value="tps" ${sort === 'tps' ? 'selected' : ''}>最高吞吐</option>
         </select>
+        <label class="has-toggle"><input class="has-enabled" type="checkbox" ${s.config.hasEnabled ? 'checked' : ''} onchange="saveCfg('${s.id}','hasEnabled',this.checked)"> 能力筛选钉住（has）</label>
+        <input class="has-values" aria-label="所需能力（逗号分隔）" placeholder="输入能力，以逗号分隔" value="${escapeHtml(has.join(', '))}" ${s.config.hasEnabled ? '' : 'disabled'} onchange="saveCfg('${s.id}','has',this.value)">
       </td>
       <td><div class="row-actions">
         <button class="ghost" onclick="probe('${s.id}', this)">探测</button>
@@ -541,11 +546,15 @@ async function saveModelCfg(id, patch) {
     exclude: patch.exclude !== undefined ? patch.exclude : (cfg.exclude || []),
     pinMode: patch.pinMode !== undefined ? patch.pinMode : (cfg.pinMode || 'strict'),
     sort: patch.sort !== undefined ? patch.sort : (cfg.sort || null),
+    hasEnabled: patch.hasEnabled !== undefined ? patch.hasEnabled : (cfg.hasEnabled === true),
+    has: patch.has !== undefined ? patch.has : (cfg.has ?? (/(?:^|\/)deepseek(?:[\/.-]|$)/i.test(id) ? ['vision', 'implicit-caching'] : [])),
   };
   try {
     const r = await api('/api/config', { perModel: { [id]: full } });
     if (r.ok) {
       cfg.upstreams = full.upstreams; cfg.exclude = full.exclude; cfg.pinMode = full.pinMode; cfg.sort = full.sort;
+      cfg.hasEnabled = full.hasEnabled; cfg.has = full.has;
+      updateRowUi(id);
       status(`${id} 配置已保存`);
     } else {
       status(`${id} 保存失败：${r.error?.message || '未知错误'}`);
@@ -561,6 +570,8 @@ async function saveCfg(id, field, value) {
   const patch = {};
   if (field === 'pinMode') patch.pinMode = value || 'strict';
   else if (field === 'sort') patch.sort = value || null;
+  else if (field === 'hasEnabled') patch.hasEnabled = value;
+  else if (field === 'has') patch.has = [...new Set(value.split(',').map((v) => v.trim()).filter(Boolean))];
   await saveModelCfg(id, patch);
 }
 
@@ -598,6 +609,10 @@ function updateRowUi(id) {
   const selects = tr.cells[5].querySelectorAll('select');
   if (selects[0]) selects[0].value = cfg.pinMode || 'strict';
   if (selects[1]) selects[1].value = cfg.sort || '';
+  tr.querySelector('.has-enabled').checked = cfg.hasEnabled === true;
+  const hasInput = tr.querySelector('.has-values');
+  hasInput.disabled = cfg.hasEnabled !== true;
+  hasInput.value = (cfg.has ?? (/(?:^|\/)deepseek(?:[\/.-]|$)/i.test(id) ? ['vision', 'implicit-caching'] : [])).join(', ');
 }
 
 // 面板药丸切换：kind='sel' 优先 | 'excl' 排除（互斥）。乐观更新 + 保存（失败自动回滚）
